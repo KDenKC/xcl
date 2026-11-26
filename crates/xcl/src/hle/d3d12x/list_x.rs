@@ -3008,7 +3008,9 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
         // a list that did not close is no segment: the call waits in its list instead
         static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
         warn(&CLOSE_ERR, "put-off segment", format_args!("Close failed ({hr:#x})"));
-        super::title_list::put_spare(wrapper, p);
+        real::dispatch_chain::list_reset(p as usize);
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(2));
+        release(p);
         return None;
     }
     super::title_list::push_segment(wrapper, p);
@@ -7171,6 +7173,10 @@ mod tests {
             let mut segs = Vec::new();
             assert!(title_list::push_segments(wrap, &mut segs));
             assert_eq!(segs.len(), 3, "the dispatch was put off");
+            let refused = segs[1];
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(refused as *const *const usize)).add(1));
+            add_ref(refused); // Keep a test reference so final Release can reveal a lost owner.
 
             // the replay's recording fails in the runtime: a query begun and never ended
             let mut heap: Option<ID3D12QueryHeap> = None;
@@ -7203,8 +7209,14 @@ mod tests {
             crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the submission runs");
             assert!(dev.GetDeviceRemovedReason().is_ok(), "the device stays");
 
+            // The failed-Close list cannot Reset. Its next spare reuse must not lose the
+            // wrapper's owning reference when a new segment is made instead.
+            assert!(deferred_segment(wrap, pc0, D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             rel_fn(wrap);
+            let release_ref: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(refused as *const *const usize)).add(2));
+            assert_eq!(release_ref(refused), 0, "the refused segment retained an untracked owner");
             let _ = pso_async::released(standin);
         }
     }
