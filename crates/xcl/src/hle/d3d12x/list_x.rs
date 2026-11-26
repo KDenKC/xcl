@@ -31,6 +31,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::device_x::{self, DepthBias};
 use super::real;
 
+#[cfg(test)]
+#[path = "list_x_render_targets_tests.rs"]
+mod render_target_tests;
+
 const PC_GET_TYPE: usize = 8;
 const PC_CLOSE: usize = 9;
 const PC_RESET: usize = 10;
@@ -336,6 +340,7 @@ struct Bindings {
     stencil: Option<u32>,
     vertex_buffers: std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>,
     render_targets: Option<RenderTargets>,
+    render_target_copies: Vec<ID3D12DescriptorHeap>,
     /// slot → the title's (address, bytes, stride) of the vertex buffer (`XCL_TRACE_FRAME`)
     vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
     /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
@@ -2778,6 +2783,37 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
     }
 }
 
+// A rewrite between OMSetRenderTargets and the draw is still read here; native copies at OMSet.
+unsafe fn snapshot_render_targets(list: *mut c_void, b: &mut Bindings) -> Option<()> {
+    let Some(rt) = b.render_targets.as_mut() else { return Some(()) };
+    let dev = device_of(list)?;
+    let mut copies = Vec::new();
+    for (ty, count) in [(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rt.num_targets), (D3D12_DESCRIPTOR_HEAP_TYPE_DSV, rt.dsv.is_some() as u32)] {
+        if count == 0 {
+            continue;
+        }
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: ty, NumDescriptors: count, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0,
+        }).ok()?;
+        let base = heap.GetCPUDescriptorHandleForHeapStart();
+        let step = dev.GetDescriptorHandleIncrementSize(ty) as usize;
+        for i in 0..count as usize {
+            let src = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV { rt.dsv? }
+                else if rt.single != 0 { rt.handles[0] + i * step } else { rt.handles[i] };
+            dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + i * step }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src }, ty);
+        }
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV {
+            rt.dsv = Some(base.ptr);
+        } else {
+            rt.handles = vec![base.ptr];
+            rt.single = 1;
+        }
+        copies.push(heap);
+    }
+    b.render_target_copies = copies;
+    Some(())
+}
+
 /// Ends `list`'s segment and opens the next; with `dispatch`, a closed segment for it comes between.
 unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
@@ -2788,6 +2824,11 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
+    let mut captured = if matches!(dispatch, Some(Deferred::Indirect(..))) && !super::real::is_console_compute(super::bind::tracked_pso(list)) {
+        let mut b = LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.bindings.clone();
+        snapshot_render_targets(list, &mut b)?;
+        Some(b)
+    } else { None };
     let deferred = match dispatch {
         Some(what) => {
             // (a predicated call stays in its list, and one inside a query: put off, the query would
@@ -2950,7 +2991,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
             s.list_type = Some(ty);
             // (what a draw put off to the submit needs again there: `record_deferred`; the title's
             // pipeline stays the key when the real one is bound there, as on its list)
-            s.bindings = bindings.clone();
+            s.bindings = captured.take().unwrap_or_else(|| bindings.clone());
             s.bound_pso = bound_pso;
             s.depth_bias = depth_bias;
             s.index_buffer = index_buffer;
