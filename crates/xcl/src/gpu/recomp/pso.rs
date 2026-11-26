@@ -954,6 +954,15 @@ fn direct_fallback(stage: &str, err: &str) {
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    direct_compute_entry(blob, sampler_base, windows, split_wave64, false)
+}
+
+/// DispatchX's distinct direct entry. A failed translation must not fall back to an unmasked shader.
+pub(crate) fn masked_compute(blob: &[u8], windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    direct_compute_entry(blob, 0, windows, split_wave64, true)
+}
+
+fn direct_compute_entry(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool, masked: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
@@ -962,7 +971,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
-    if super::lower_dxil::enabled() {
+    if !masked && super::lower_dxil::enabled() {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -975,8 +984,14 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
-    dump_direct(blob, &k.dxil);
+    use crate::gpu::dxil::kernel;
+    let k = if masked {
+        kernel::translate_compute_with_thread_limits(code, o, &cs, split_wave64)?
+    } else {
+        let k = kernel::translate_compute_on(code, o, &cs, split_wave64)?;
+        dump_direct(blob, &k.dxil);
+        k
+    };
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
 

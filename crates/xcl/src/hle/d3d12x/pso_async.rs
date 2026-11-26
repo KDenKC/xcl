@@ -23,6 +23,8 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// Only workers may take this build, including nested worker waits and deferred replay.
+    worker_only: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
@@ -49,6 +51,8 @@ struct Demand {
 thread_local! {
     /// what this worker is building
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+    /// Pool helpers can run without a parent Pending (`build_pieces` called by a title thread).
+    static WORKER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
@@ -301,6 +305,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+                WORKER_THREAD.with(|w| w.set(true));
                 let next = rx.lock().unwrap().recv();
                 let Ok(work) = next else { return };
                 while let Some(p) = next_needed() {
@@ -366,7 +371,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, false);
+}
+
+/// Keep a build off title threads; a worker may build an unstarted dependency inline.
+pub fn submit_worker_only(standin: usize, compute: bool, job: Job, key: u64) {
+    submit_as(standin, compute, job, true, key, true);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -382,10 +392,10 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, false);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, worker_only: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -394,6 +404,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        worker_only,
         key,
         used: Default::default(),
         orphan: Default::default(),
@@ -520,6 +531,7 @@ fn preload() -> Option<&'static Preload> {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+                WORKER_THREAD.with(|w| w.set(true));
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -559,6 +571,96 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn worker_only_wait_does_not_take_an_unstarted_job() {
+        let caller = std::thread::current().id();
+        let (send, recv) = mpsc::channel();
+        let pso = 0x7E57_55A1;
+        // Leave the job unqueued, so the old resolver deterministically takes it locally.
+        submit_as(pso, true, Box::new(move || { send.send(std::thread::current().id()).unwrap(); 0 }), false, 0, true);
+        assert_eq!(resolve_wait_for(pso, None), pso);
+        let builder = recv.recv().unwrap();
+        assert_eq!(released(pso), 0);
+        assert_ne!(builder, caller, "a worker-only job ran on the waiting caller");
+    }
+
+    #[test]
+    fn worker_only_submission_keeps_the_budget_and_used_key() {
+        let (send, recv) = mpsc::channel();
+        let pso = 0x7E57_55A2;
+        let key = 0x7E57_55A3;
+        submit_worker_only(pso, true, Box::new(move || { recv.recv().unwrap(); 0 }), key);
+        let waiting = resolve_wait_for(pso, Some(std::time::Duration::ZERO));
+        let noted = used::noted(key);
+        send.send(()).unwrap();
+        assert_eq!(resolve_wait_for(pso, None), pso);
+        assert_eq!(released(pso), 0);
+        assert_eq!(waiting, pso, "the budget expires while the worker is held");
+        assert!(noted, "worker-only use retains the supplied pipeline key");
+    }
+
+    #[test]
+    fn worker_only_policy_does_not_change_ordinary_local_waits() {
+        let caller = std::thread::current().id();
+        let (send, recv) = mpsc::channel();
+        let pso = 0x7E57_55A4;
+        submit_as(pso, true, Box::new(move || { send.send(std::thread::current().id()).unwrap(); 0 }), false, 0, false);
+        assert_eq!(resolve_wait_for(pso, None), pso);
+        let builder = recv.recv().unwrap();
+        assert_eq!(released(pso), 0);
+        assert_eq!(builder, caller, "ordinary unstarted jobs retain the existing local fast path");
+    }
+
+    #[test]
+    fn worker_only_nested_wait_builds_an_unstarted_dependency_inline() {
+        nested_worker_wait(false);
+    }
+
+    #[test]
+    fn worker_only_piece_helper_can_build_a_dependency_without_a_parent() {
+        nested_worker_wait(true);
+    }
+
+    fn nested_worker_wait(piece_helper: bool) {
+        let offset = if piece_helper { 2 } else { 0 };
+        let (child, parent) = (0x7E57_55A5 + offset, 0x7E57_55A6 + offset);
+        let (child_send, child_recv) = mpsc::channel();
+        let (parent_send, parent_recv) = mpsc::channel();
+        // The dependency is deliberately unstarted. Enter the same build_queued/build
+        // context as a pool worker, without needing to saturate the global test pool.
+        submit_as(child, true, Box::new(move || {
+            child_send.send(std::thread::current().id()).unwrap();
+            0
+        }), false, 0, true);
+        submit_as(parent, true, Box::new(move || {
+            let outer = BUILDING.with(|b| b.borrow().clone());
+            let resolved = resolve_wait_for(child, None);
+            let kept_context = BUILDING.with(|b| match (&outer, &*b.borrow()) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b), (None, None) => true, _ => false,
+            });
+            parent_send.send((std::thread::current().id(), resolved, kept_context)).unwrap();
+            0
+        }), false, 0, false);
+        let pending = entry(parent).unwrap();
+        std::thread::spawn(move || {
+            if piece_helper {
+                WORKER_THREAD.with(|w| w.set(true));
+                assert!(!building_here()); // build_pieces helper whose submitting thread had no Pending
+                let job = pending.job.lock().unwrap().take().unwrap();
+                complete(&pending, job());
+            } else {
+                build_queued(&pending);
+            }
+        }).join().unwrap();
+        let (worker, resolved, kept_context) = parent_recv.recv().unwrap();
+        let dependency_worker = child_recv.recv().unwrap();
+        assert_eq!(released(child), 0);
+        assert_eq!(released(parent), 0);
+        assert_eq!(resolved, child);
+        assert!(kept_context, "the parent build context survives the nested wait");
+        assert_eq!(dependency_worker, worker, "an unstarted dependency must not wait behind a saturated worker pool");
+    }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
@@ -1082,9 +1184,16 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
+    // A worker must drain an unstarted dependency itself: the pool may all be waiting.
+    if p.worker_only && !building_here() && !WORKER_THREAD.with(|w| w.get()) {
+        if !p.sent.swap(true, Ordering::AcqRel) {
+            enqueue(p.clone());
+        }
+    } else {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
     }
     p.want();
     let mut done = p.done.lock().unwrap();

@@ -27,6 +27,16 @@ fn interface(threads: [u32; 3]) -> CsInterface {
     CsInterface { threads, user_sgprs: 0, tgid: [true; 3], tg_size: false, tid_components: 3 }
 }
 
+pub(crate) fn wave32_store_container(groups: [u32; 3]) -> Vec<u8> {
+    use crate::gpu::xbox::tests::{fssm, sample};
+    let mut header = fssm(&stores([32, 1, 1], groups), &[(6, 1)]);
+    header[0xd4] = 1 << 5; // wave32
+    for (word, value) in header[0x138..0x148].chunks_exact_mut(4).zip([0x1380u32, 32, 1, 1]) {
+        word.copy_from_slice(&value.to_le_bytes());
+    }
+    sample(5, &[header])
+}
+
 fn masked_stores(wave64: bool, split: bool) {
     if recomp::dxc::location().is_err() { runner::skip_test("no DXC"); return; }
     let supported = if wave64 && !split { runner::wave64_supported() } else { runner::wave32_supported() };

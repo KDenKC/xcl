@@ -895,11 +895,11 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
 
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
-    let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
-        return super::pso_async::need_by_submit(pso);
+    let bound = with(this, |s| s.pso);
+    if super::pso_async::is_pending(bound) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+        return super::pso_async::need_by_submit(bound);
     }
-    let pso = super::pso_async::resolve_wait(pso);
+    let pso = super::pso_async::resolve_wait(bound);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -927,8 +927,23 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
             crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
         }
     }
-    with(this, |s| s.limits = limits);
-    let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
+    let target = super::real::masked_dispatch_pso(pso, limits, || {
+        super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags))
+    });
+    let done = match target {
+        Ok(Some((pso, owner))) => {
+            with(this, |s| s.limits = limits);
+            let result = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
+            if owner.is_some() {
+                // Internal SetPipelineState calls also update the list_x tracker used
+                // by Reset/Kickoff. Restore its title-visible binding after the variant.
+                super::list_x::on_set_pipeline_state(this, bound);
+            }
+            result
+        }
+        Ok(None) => return,
+        Err(reason) => Err(reason.into()),
+    };
     with(this, |s| s.limits = [0; 3]);
     match done {
         Ok(()) => count(DISPATCHES),

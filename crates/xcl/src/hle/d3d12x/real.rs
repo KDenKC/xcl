@@ -1716,8 +1716,10 @@ pub(super) fn standin_released(pso: usize) {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let masked = MASKED_COMPUTE.lock().unwrap().get(&(this as usize)).cloned();
     let n = f(this);
     if n == 0 {
+        if let Some(source) = masked { forget_masked_source(this as usize, &source); }
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
     }
@@ -4325,7 +4327,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_in, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -4338,7 +4340,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let split = wave32_only(this);
+    let windows = crate::gpu::recomp::pso::mem_windows();
+    let compiled = match console_to_dxil_in(cs, Stage::Compute, 0, split, windows) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -4363,6 +4367,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
             note_translated_compute(0, ppv);
+            remember_masked_source(*ppv as usize, this, f, d, cs, windows, split);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
         }
@@ -4395,6 +4400,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
     note_translated_compute(hr, ppv);
+    remember_masked_source(*ppv as usize, this, f, d, cs, windows, split);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -5329,6 +5335,94 @@ pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
 #[cfg(test)]
 mod shaders_key_tests {
     #[test]
+    fn dispatchx_runtime_selects_and_reuses_a_masked_pipeline_only_for_partial_groups() {
+        use super::*;
+        use crate::gpu::{dxil, recomp};
+        if recomp::dxc::location().is_err() || recomp::runner::wave32_supported() != Ok(true) {
+            recomp::runner::skip_test("requires DXC and wave32");
+            return;
+        }
+        init().expect("create the XCL D3D12 device");
+        let raw = device_raw();
+        let device = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.expect("initialized D3D12 device");
+        let groups = [4, 1, 1];
+        let shader = dxil::dispatchx_tests::wave32_store_container(groups);
+        let create: PsoFn = unsafe { std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateComputePipelineState"))) };
+        let base_key = Box::new(0u8);
+        let base = &*base_key as *const u8 as usize;
+        let source_for = |shader| std::sync::Arc::new(MaskedComputeSource {
+            device: device.clone(), create, shader, windows: 1, split: false,
+            flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, variant: OnceLock::new(),
+        });
+        let old = source_for(Vec::new());
+        MASKED_COMPUTE.lock().unwrap().insert(base, old.clone());
+        let source = source_for(shader);
+        MASKED_COMPUTE.lock().unwrap().insert(base, source.clone());
+        struct Unregister(usize, std::sync::Arc<MaskedComputeSource>);
+        impl Drop for Unregister {
+            fn drop(&mut self) { forget_masked_source(self.0, &self.1); }
+        }
+        let _registration = Unregister(base, source.clone());
+        forget_masked_source(base, &old);
+        assert!(std::sync::Arc::ptr_eq(&MASKED_COMPUTE.lock().unwrap()[&base], &source));
+        let select = |limits| masked_dispatch_pso(base, limits, || false).unwrap().unwrap();
+        assert_eq!(select([0; 3]).0, base);
+        assert!(source.variant.get().is_none());
+        let (variant, _owner) = select([100, 0, 0]);
+        assert_ne!(variant, base);
+        assert_eq!(select([10, 0, 0]).0, variant);
+        assert_eq!(select([0; 3]).0, base);
+        let raw = variant as *mut c_void;
+        let root = pso_root_signature(variant).unwrap() as *mut c_void;
+        let (pso, rs) = unsafe { (ID3D12PipelineState::from_raw_borrowed(&raw).unwrap(), ID3D12RootSignature::from_raw_borrowed(&root).unwrap()) };
+        let mut io = [0; recomp::KERNEL_SGPRS];
+        io[recomp::IO_THREAD_LIMIT[0]] = 100;
+        let result = recomp::runner::dispatch_on(device, pso, rs, groups, &io, &[0; 128]).unwrap();
+        assert_eq!(&result[..100], &(1..=100).collect::<Vec<_>>());
+        assert_eq!(&result[100..], &[0; 28]);
+    }
+
+    #[test]
+    fn dispatchx_failed_variant_is_built_once_and_never_selects_its_token() {
+        use std::sync::{Arc, OnceLock, atomic::{AtomicUsize, Ordering}};
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let variant = OnceLock::new();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let pending = variant.get_or_init(|| {
+                        let builds = builds.clone();
+                        super::QueuedMaskedPso::new(Box::new(move || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            0
+                        }), 0)
+                    });
+                    assert!(pending.resolve_or_defer(|| false).is_err());
+                });
+            }
+        });
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let pending = variant.into_inner().unwrap();
+        let token = pending.token();
+        drop(pending);
+        assert_eq!(super::super::pso_async::resolve_wait(token), token);
+    }
+
+    #[test]
+    fn dispatchx_pending_variant_can_defer_and_replay_reports_failure() {
+        let (finish, wait) = std::sync::mpsc::channel();
+        let queued = super::QueuedMaskedPso::new(Box::new(move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+            0
+        }), 0);
+        let result = queued.resolve_or_defer(|| true);
+        let _ = finish.send(());
+        assert_eq!(result.unwrap(), None);
+        assert!(queued.resolve_or_defer(|| false).is_err());
+    }
+
+    #[test]
     fn a_key_follows_the_shaders_and_their_order_and_is_never_zero() {
         let (a, b) = (vec![1u8, 2, 3], vec![4u8, 5]);
         let key = super::shaders_key(&[a.clone(), b.clone()]);
@@ -5338,6 +5432,126 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
         assert_ne!(super::shaders_key(&[]), 0);
     }
+}
+
+/// An internal pending key with a unique address for as long as the variant can be selected.
+struct QueuedMaskedPso(Box<u8>);
+
+impl QueuedMaskedPso {
+    fn new(job: super::pso_async::Job, key: u64) -> Self {
+        let pending = Self(Box::new(0));
+        super::pso_async::submit_worker_only(pending.token(), true, job, key);
+        pending
+    }
+
+    fn token(&self) -> usize { &*self.0 as *const u8 as usize }
+
+    fn resolve_or_defer(&self, defer: impl FnOnce() -> bool) -> Result<Option<usize>, &'static str> {
+        let token = self.token();
+        if super::pso_async::is_pending(token) && defer() {
+            super::pso_async::need_by_submit(token);
+            return Ok(None);
+        }
+        let resolved = super::pso_async::resolve_wait(token);
+        (resolved != token && resolved != 0).then_some(Some(resolved)).ok_or("DispatchX masked pipeline unavailable")
+    }
+}
+
+impl Drop for QueuedMaskedPso {
+    fn drop(&mut self) {
+        super::pso_async::release(super::pso_async::released(self.token()));
+    }
+}
+
+pub(super) struct MaskedComputeSource {
+    device: ID3D12Device,
+    create: PsoFn,
+    shader: Vec<u8>,
+    windows: u32,
+    split: bool,
+    flags: D3D12_PIPELINE_STATE_FLAGS,
+    node: u32,
+    variant: OnceLock<QueuedMaskedPso>,
+}
+
+static MASKED_COMPUTE: std::sync::LazyLock<Mutex<HashMap<usize, std::sync::Arc<MaskedComputeSource>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn forget_masked_source(base: usize, expected: &std::sync::Arc<MaskedComputeSource>) {
+    let old = {
+        let mut sources = MASKED_COMPUTE.lock().unwrap();
+        match sources.entry(base) {
+            std::collections::hash_map::Entry::Occupied(entry) if std::sync::Arc::ptr_eq(entry.get(), expected) => Some(entry.remove()),
+            _ => None,
+        }
+    };
+    drop(old);
+}
+
+unsafe fn remember_masked_source(base: usize, device: *mut c_void, create: PsoFn,
+    desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC, shader: &[u8], windows: u32, split: bool) {
+    if base == 0 || !crate::gpu::dxil::kernel::enabled() || crate::gpu::recomp::lower_dxil::enabled() {
+        return;
+    }
+    let Some(device) = ID3D12Device::from_raw_borrowed(&device).cloned() else { return };
+    let source = std::sync::Arc::new(MaskedComputeSource {
+        device, create, shader: shader.to_vec(), windows, split, flags: desc.Flags,
+        node: desc.NodeMask, variant: OnceLock::new(),
+    });
+    let old = MASKED_COMPUTE.lock().unwrap().insert(base, source);
+    drop(old);
+}
+
+/// Keep an owner of the variant through recording the dispatch. A known variant that
+/// failed or reached the wait budget returns an error rather than executing excess lanes.
+pub(super) fn masked_dispatch_pso(base: usize, limits: [u32; 3], defer: impl FnOnce() -> bool)
+    -> Result<Option<(usize, Option<std::sync::Arc<MaskedComputeSource>>)>, &'static str> {
+    if limits == [0; 3] { return Ok(Some((base, None))) }
+    let Some(source) = MASKED_COMPUTE.lock().unwrap().get(&base).cloned() else { return Ok(Some((base, None))) };
+    let pending = source.variant.get_or_init(|| {
+        // Capture the inputs rather than the source itself, which owns this queued key.
+        let device = source.device.clone();
+        let create = source.create;
+        let shader = source.shader.clone();
+        let (windows, split, flags, node) = (source.windows, source.split, source.flags, source.node);
+        QueuedMaskedPso::new(Box::new(move || unsafe {
+            build_masked_compute(&device, create, &shader, windows, split, flags, node).unwrap_or(0)
+        }), 0)
+    });
+    Ok(pending.resolve_or_defer(defer)?.map(|pso| (pso, Some(source))))
+}
+
+unsafe fn build_masked_compute(device: &ID3D12Device, create: PsoFn, shader: &[u8], windows: u32,
+    split: bool, flags: D3D12_PIPELINE_STATE_FLAGS, node: u32) -> Option<usize> {
+    use crate::gpu::recomp::pso;
+    let compiled = pso::masked_compute(shader, windows, split).ok()?;
+    let iface = pso::compute_interface(shader)?;
+    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { Flags: flags, NodeMask: node, ..Default::default() };
+    let record = crate::gpu::shader::fnv64(shader);
+    let iid = pc_iid(Kind::PipelineState);
+    let mut out = std::ptr::null_mut();
+    let chain_rs = compiled.dispatch_chain.and_then(|chain| dispatch_chain::build(
+        device.as_raw(), create, &desc, &iid, &mut out, record, &compiled.dxil, &compiled.samplers, chain));
+    let rs = if let Some(rs) = chain_rs {
+        // The scratch-allocation fallback uses the whole program. Resolve it here too
+        // so it cannot trigger a driver compile on a title or submit thread later.
+        if dispatch_chain::whole(out as usize).is_err() {
+            super::pso_async::release(out as usize);
+            return None;
+        }
+        rs as *mut c_void
+    } else {
+        let rs = abi_rs_for(device.as_raw(), &compiled.samplers)?;
+        if compute_container(device.as_raw(), create, &desc, rs, &compiled.dxil, record, &iid, &mut out, false).0 < 0 {
+            return None;
+        }
+        rs
+    };
+    if out.is_null() { return None }
+    note_pso_rs(out, rs);
+    PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(out as usize, (iface.user_sgprs, iface.threads));
+    note_translated_compute(0, &mut out);
+    Some(out as usize)
 }
 
 impl OwnedDesc {
