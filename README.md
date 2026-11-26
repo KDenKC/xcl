@@ -415,7 +415,9 @@ GameInput: input_rule {"event":"pressed","rule":"legal-notices","frame":180,"t":
 GameInput: input_rule {"event":"completed","rule":"legal-notices","frame":180,"t":77.2}
 ```
 
-Times are host uptime seconds; sequence events retain the triggering frame number. Fallback
+`XCL_PRESS_AT`, `XCL_PRESS_A_AT`, fallback start, and the JSON event's `t` count seconds from guest
+startup, after shader preparation. The log prefix still shows host uptime. Sequence waits are
+relative to the matching frame, and sequence events retain its frame number. Fallback
 presses use rule `$fallback`; disabled events have `rule` and `reason` (no frame or time).
 
 ## Tests
