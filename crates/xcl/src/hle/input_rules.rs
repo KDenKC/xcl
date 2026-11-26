@@ -79,6 +79,10 @@ fn sequence(text: &str) -> Result<(Vec<(f64, u32, String)>, f64), String> {
             next = last.take().unwrap_or(next) + wait;
         } else {
             let button = super::gameinput::button_named(token).ok_or_else(|| format!("unknown button {token:?}"))?;
+            // Repeated levels need a release interval; touching 200 ms pulses look like one hold.
+            if presses.last().is_some_and(|(at, previous, _)| *previous == button && next + 1e-9 < *at + 0.3) {
+                return Err("consecutive presses of the same button must start at least 0.3 seconds apart".into());
+            }
             presses.push((next, button, token.to_ascii_uppercase()));
             last = Some(next);
             next += 0.8;
@@ -206,6 +210,36 @@ mod tests {
             format!("{RULE}typo=true\n"), format!("{RULE}{RULE}")] {
             assert!(Engine::parse(&bad, |_| Ok([0; WIDTH * HEIGHT])).is_err(), "{bad}");
         }
+    }
+    #[test]
+    fn touching_same_button_pulses_are_rejected_or_have_a_release() {
+        let text = RULE.replace("DOWN, wait 5, A", "A, wait 0.2, A");
+        // Rejection is valid; accepting this sequence must never merge the two pulses.
+        if let Ok((mut e, _)) = Engine::parse(&text, |_| Ok([0; WIDTH * HEIGHT])) {
+            e.frame(&[0; WIDTH * HEIGHT], 1, 0.0).unwrap();
+            assert_eq!(e.buttons(0.19).0, super::super::gameinput::A);
+            assert_eq!(e.buttons(0.20).0, 0, "the title needs a button-up between repeated presses");
+            assert_eq!(e.buttons(0.21).0, 0);
+        }
+    }
+    #[test]
+    fn repeated_button_parser_requires_a_release_margin() {
+        for text in ["A, wait 0.2, A", "A, wait 0.299, a", "A, wait 0.2, A, DOWN"] {
+            let error = sequence(text).unwrap_err();
+            assert!(error.contains("0.3"), "{error}");
+        }
+        assert!(sequence("A, wait 0.3, a").is_ok());
+        assert!(sequence("A, A").is_ok());
+        assert!(sequence("A, wait 0.2, DOWN").is_ok());
+    }
+    #[test]
+    fn spaced_repeated_buttons_expose_button_up_at_the_boundary() {
+        let mut e = engine(&RULE.replace("DOWN, wait 5, A", "A, wait 0.3, A"));
+        e.frame(&[0; WIDTH * HEIGHT], 1, 0.0).unwrap();
+        assert_eq!(e.buttons(0.19).0, super::super::gameinput::A);
+        assert_eq!(e.buttons(0.20).0, 0);
+        assert_eq!(e.buttons(0.21).0, 0);
+        assert_eq!(e.buttons(0.30).0, super::super::gameinput::A);
     }
     #[test]
     fn missing_reference_disables_rule_and_fallback_without_pressing() {

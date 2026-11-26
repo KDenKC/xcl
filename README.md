@@ -360,6 +360,8 @@ terms and confirmation sequence runs after a three-second screen transition wait
 Button pulses last 0.2 seconds, with 0.8 seconds between
 button starts by default. `wait N` sets the delay from the previous button's start (or adds
 to a preceding wait). Input must be polled during the pulse to receive it.
+Consecutive presses of the same button must start at least 0.3 seconds apart, leaving at least
+0.1 seconds for release; shorter repeats are rejected with a configuration error.
 
 Rules and reference images load once at host startup, before title path remapping is installed.
 Use host filesystem paths, not console mounts: rules are TOML; relative reference paths resolve
