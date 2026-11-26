@@ -362,6 +362,8 @@ button starts by default. `wait N` sets the delay from the previous button's sta
 to a preceding wait). Input must be polled during the pulse to receive it.
 Consecutive presses of the same button must start at least 0.3 seconds apart, leaving at least
 0.1 seconds for release; shorter repeats are rejected with a configuration error.
+If the fallback is holding the rule's first button when it matches, the sequence starts after
+that fallback pulse plus the release margin. A different first button starts immediately.
 
 Rules and reference images load once at host startup, before title path remapping is installed.
 Use host filesystem paths, not console mounts: rules are TOML; relative reference paths resolve

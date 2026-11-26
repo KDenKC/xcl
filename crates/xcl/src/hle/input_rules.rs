@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 const HOLD: f64 = 0.2;
+const RELEASE_GAP: f64 = 0.1;
 fn yes() -> bool { true }
 fn cooldown() -> f64 { 3.0 }
 #[derive(Deserialize)]
@@ -80,7 +81,7 @@ fn sequence(text: &str) -> Result<(Vec<(f64, u32, String)>, f64), String> {
         } else {
             let button = super::gameinput::button_named(token).ok_or_else(|| format!("unknown button {token:?}"))?;
             // Repeated levels need a release interval; touching 200 ms pulses look like one hold.
-            if presses.last().is_some_and(|(at, previous, _)| *previous == button && next + 1e-9 < *at + 0.3) {
+            if presses.last().is_some_and(|(at, previous, _)| *previous == button && next + 1e-9 < *at + HOLD + RELEASE_GAP) {
                 return Err("consecutive presses of the same button must start at least 0.3 seconds apart".into());
             }
             presses.push((next, button, token.to_ascii_uppercase()));
@@ -124,9 +125,17 @@ impl Engine {
             if r.last.is_some_and(|last| r.spec.once || t - last < r.spec.cooldown) { continue; }
             let diff = difference(image, &r.reference, r.spec.region);
             if diff <= r.spec.threshold {
+                let mut start = t;
+                if let Some(f) = self.fallback.as_ref().filter(|f| !self.claimed && t >= f.start) {
+                    let elapsed = t - f.start;
+                    if elapsed % f.interval < HOLD && super::gameinput::button_named(&f.button) == Some(r.presses[0].1) {
+                        let released = f.start + (elapsed / f.interval).floor() * f.interval + HOLD + RELEASE_GAP;
+                        start = start.max(released - r.presses[0].0);
+                    }
+                }
                 r.last = Some(t);
                 self.claimed = true;
-                self.playing = Some(Playing { rule: index, start: t, frame, pressed: None });
+                self.playing = Some(Playing { rule: index, start, frame, pressed: None });
                 return Some(Event { event: "matched", rule: r.spec.name.clone(), frame, t, diff: Some(diff), button: None });
             }
         }
@@ -261,6 +270,25 @@ mod tests {
         assert_eq!(e.buttons(63.0).0, super::super::gameinput::A);
         assert_eq!(e.buttons(63.3).1.unwrap().event, "completed");
         assert!(e.frame(&[0; WIDTH * HEIGHT], 21, 64.0).is_none(), "once");
+
+        let same = RULE.replace("DOWN, wait 5, A", "A");
+        let mut e = engine(&format!("[fallback]\nbutton='A'\nstart=57\ninterval=3\n{same}"));
+        assert_eq!(e.buttons(57.05).0, super::super::gameinput::A);
+        assert_eq!(e.frame(&[0; WIDTH * HEIGHT], 20, 57.10).unwrap().event, "matched");
+        for t in [57.11, 57.19, 57.20, 57.29] {
+            let (buttons, event) = e.buttons(t);
+            assert_eq!(buttons, 0, "fallback-to-rule A needs a release interval at {t}");
+            assert!(event.is_none(), "the delayed rule press has not started");
+        }
+        let (buttons, event) = e.buttons(57.31);
+        assert_eq!(buttons, super::super::gameinput::A);
+        assert_eq!(event.unwrap().rule, "menu");
+        assert_eq!(e.buttons(57.51).1.unwrap().event, "completed");
+
+        let mut e = engine(&format!("[fallback]\nbutton='A'\nstart=57\ninterval=3\n{RULE}"));
+        assert_eq!(e.buttons(57.05).0, super::super::gameinput::A);
+        e.frame(&[0; WIDTH * HEIGHT], 20, 57.10).unwrap();
+        assert_eq!(e.buttons(57.11).0, super::super::gameinput::DPAD_DOWN, "different button starts immediately");
     }
     #[test]
     fn repeated_rules_need_a_new_frame_cooldown_and_no_active_sequence() {
