@@ -42,6 +42,8 @@ mod compact_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
+mod dispatchx_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod ops_tests;

@@ -131,6 +131,8 @@ pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Res
 pub enum Entry {
     Kernel,
     Compute(CsInterface),
+    /// On-demand DispatchX variant; ordinary compute keeps its original prologue.
+    ComputeMasked(CsInterface),
     Mesh(MsInterface),
     Vertex(VsInterface),
     Pixel(PsInterface),
@@ -146,6 +148,12 @@ pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Res
 pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
     let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
     translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
+}
+
+/// A partial DispatchX group: IO_THREAD_LIMIT bounds each axis (0 means unbounded).
+pub fn translate_compute_with_thread_limits(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
+    let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
+    translate_entry(code, o, Entry::ComputeMasked(cs.clone()), compact_mode(), None, tables)
 }
 
 fn translate_entry(
@@ -203,9 +211,9 @@ fn translate_on_this_thread(
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
-    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_) | Entry::ComputeMasked(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
-    let compute = matches!(entry, Entry::Compute(_));
+    let compute = matches!(entry, Entry::Compute(_) | Entry::ComputeMasked(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
@@ -223,10 +231,13 @@ fn translate_on_this_thread(
             lw.init.vgpr_base = Some(base);
             [if o.wave64 { 64 } else { 32 }, 1, 1]
         }
-        Entry::Compute(cs) => {
+        Entry::Compute(cs) | Entry::ComputeMasked(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
             if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
             compute_init(&mut lw, cs, tid, gtid);
+            if matches!(entry, Entry::ComputeMasked(_)) {
+                mask_compute_threads(&mut lw, cs, gtid);
+            }
             cs.threads
         }
         Entry::Mesh(ms) => {
@@ -477,7 +488,7 @@ impl Lw {
         let split = o.wave64 && o.split;
         let kernel = matches!(entry, Entry::Kernel);
         let cs = match entry {
-            Entry::Compute(cs) => Some(cs.clone()),
+            Entry::Compute(cs) | Entry::ComputeMasked(cs) => Some(cs.clone()),
             _ => None,
         };
         let ms = match entry {
@@ -584,7 +595,7 @@ impl Lw {
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,
-            Entry::Compute(cs) => Some(cs.threads.iter().product()),
+            Entry::Compute(cs) | Entry::ComputeMasked(cs) => Some(cs.threads.iter().product()),
             Entry::Mesh(ms) => Some(ms.threads),
             Entry::Geometry(_) => Some(64),
         };
@@ -747,6 +758,33 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
         }
     }
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+}
+
+/// Apply the thread bounds after the existing padding-lane mask. Ballot exchanges the
+/// two halves of a split wave64 before EXEC disables either half's out-of-range lanes.
+fn mask_compute_threads(lw: &mut Lw, cs: &CsInterface, gtid: [Value; 3]) {
+    let io = lw.init.io.expect("compute I/O");
+    let mut inside = lw.s.m.i1c(true);
+    let zero = lw.c(0);
+    for k in 0..3 {
+        let offset = lw.c((crate::gpu::recomp::IO_THREAD_LIMIT[k] * 4) as u32);
+        let limit = lw.s.raw_load(io, offset, 1)[0];
+        let group = lw.s.group_id(k as u32);
+        let size = lw.c(cs.threads[k]);
+        let base = lw.mul(group, size);
+        let global = lw.add(base, gtid[k]);
+        let unbounded = lw.s.m.cmp(Pred::Eq, limit, zero);
+        let in_range = lw.s.m.cmp(Pred::ULt, global, limit);
+        let axis = lw.or(unbounded, in_range);
+        inside = lw.and(inside, axis);
+    }
+    let (mask_lo, mask_hi) = lw.ballot(inside);
+    let init = lw.init.compute.as_ref().expect("compute entry");
+    let (lo, hi) = (init.sgpr[&126], init.sgpr[&127]);
+    let (lo, hi) = (lw.and(lo, mask_lo), lw.and(hi, mask_hi));
+    let init = lw.init.compute.as_mut().unwrap();
+    init.sgpr.insert(126, lo);
+    init.sgpr.insert(127, hi);
 }
 
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the
