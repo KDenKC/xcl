@@ -7195,7 +7195,18 @@ mod tests {
             BUILD.store(true, Ordering::Release);
             record_deferred(wrap);
             assert!(!CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrap as usize), "the replay closed its segment");
-            assert!((REFUSED.load(Ordering::Acquire) as i32) < 0, "the runtime refused the recording ({:#x})", REFUSED.load(Ordering::Acquire));
+            let release = |list: *mut c_void| {
+                let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(list as *const *const usize)).add(2));
+                f(list)
+            };
+            if (REFUSED.load(Ordering::Acquire) as i32) >= 0 {
+                // Some runtimes accept Close with an open query, so this run never hits the failure path.
+                release(wrap);
+                release(refused);
+                let _ = pso_async::released(standin);
+                crate::gpu::recomp::runner::skip_test("the runtime closed a list with a query left open");
+                return;
+            }
             // what the submit collects after the replay (`q_execute_command_lists`)
             segs.clear();
             assert!(title_list::push_segments(wrap, &mut segs));
@@ -7212,11 +7223,8 @@ mod tests {
             // The failed-Close list cannot Reset. Its next spare reuse must not lose the
             // wrapper's owning reference when a new segment is made instead.
             assert!(deferred_segment(wrap, pc0, D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
-            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
-            rel_fn(wrap);
-            let release_ref: unsafe extern "system" fn(*mut c_void) -> u32 =
-                std::mem::transmute(*(*(refused as *const *const usize)).add(2));
-            assert_eq!(release_ref(refused), 0, "the refused segment retained an untracked owner");
+            release(wrap);
+            assert_eq!(release(refused), 0, "the refused segment retained an untracked owner");
             let _ = pso_async::released(standin);
         }
     }
