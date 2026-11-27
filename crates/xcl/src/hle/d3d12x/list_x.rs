@@ -7184,7 +7184,7 @@ mod tests {
             let heap = heap.unwrap();
             let h = heap.as_raw() as usize;
             static REFUSED: AtomicU32 = AtomicU32::new(0);
-            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| unsafe {
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(move |p| {
                 pc::<QueryFn>(p, PC_BEGIN_QUERY)(p, h, D3D12_QUERY_TYPE_OCCLUSION, 0);
                 let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
                 REFUSED.store(hr as u32, Ordering::Release);
@@ -7249,7 +7249,7 @@ mod tests {
                 crate::gpu::recomp::runner::skip_test("no GPU");
                 return;
             };
-            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| unsafe {
+            CLOSE_HOOK.lock().unwrap().push((wrap as usize, Box::new(|p| {
                 pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
                 windows::Win32::Foundation::E_FAIL.0
             })));
