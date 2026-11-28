@@ -343,6 +343,10 @@ where
             unsafe { D3D12CreateDevice(adapter, feature_level, &mut device)? };
         }
     }
+    // (`XCL_SAMPLER_PRELUDE`: before anything is made on it)
+    if let Some(dev) = &device {
+        super::sampler_prelude::run(dev);
+    }
     device.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
 }
 

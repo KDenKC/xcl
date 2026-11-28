@@ -1456,6 +1456,9 @@ pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[Stat
 }
 
 fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
+    if !samplers.is_empty() {
+        crate::gpu::sampler_prelude::note(if split { "XCL's chain root signature (gpu/recomp/pso.rs abi_signature)" } else { "XCL's ABI root signature (gpu/recomp/pso.rs abi_signature)" });
+    }
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)

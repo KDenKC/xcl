@@ -788,6 +788,7 @@ impl Compositor {
             pStaticSamplers: &sampler,
             Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
         };
+        crate::gpu::sampler_prelude::note("the present compositor (hle/d3d12x/present.rs Compositor::new)");
         let mut ser: Option<ID3DBlob> = None;
         D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).ok()?;
         let ser = ser?;

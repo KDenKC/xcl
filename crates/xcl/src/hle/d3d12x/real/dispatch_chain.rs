@@ -158,6 +158,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
     let rs = signature.as_raw() as usize;
+    // (also with none: an address a freed one had is noted anew)
+    super::note_rs_states(rs, samplers);
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
         flags: desc.Flags, node: desc.NodeMask, record });
     let jobs = (0..plan.pieces.len()).map(|i| {

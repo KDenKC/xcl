@@ -4493,6 +4493,7 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
         Ok(rs) => {
             let raw = rs.into_raw();
             map.insert(key, raw as usize);
+            note_rs_states(raw as usize, samplers);
             Some(raw)
         }
         Err(e) => {
@@ -5200,7 +5201,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain)
+        .and_then(|p| blob_folder(this, &rs_states(rs as usize), true).map(|f| in_folder(p, &f)));
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -6432,8 +6434,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // (no file without the adapter's identity: it could be another adapter's)
     let driver = driver_identity(this);
     let disk = driver
-        .filter(|_| blob_across_processes(!samplers.is_empty(), adapter_vendor(this)))
-        .and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes));
+        .and_then(|id| driver_cache::graphics_path(driver_cache::graphics_file_hash(gkey, id, crate::gpu::recomp::pso::mem_windows()), bytes))
+        .and_then(|p| blob_folder(this, &samplers, false).map(|f| in_folder(p, &f)));
     // (for the driver compile log of this pipeline only)
     GRAPHICS_STAGES.with(|s| s.set(Some((vs_took, ps_took))));
     // (a preparation worker keeps every blob: the title builds these pipelines at once from them)
@@ -7286,6 +7288,8 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 }
 
 mod two_pass_identity;
+#[cfg(test)]
+mod sampler_prelude_tests;
 use two_pass_identity::{two_pass_cs_key, two_pass_stream_key, Fnv64};
 
 /// Persistent driver-cache counters for the current process: (hits, rejected, saved).
@@ -7343,17 +7347,53 @@ fn blob_across_processes(static_samplers: bool, vendor: Option<u32>) -> bool {
     !(static_samplers && vendor == Some(0x10DE))
 }
 
+/// The folder under `driver\` where a pipeline with the static sampler states `states`, made on
+/// `this`, keeps and takes its disk blob ("" the usual one); None: no disk blob (#505).
+/// - With no static samplers, or not on NVIDIA: the usual folder.
+/// - `XCL_SAMPLER_PRELUDE=1` on NVIDIA: the prelude's folder when it covers every state
+///   (`sampler_prelude::covers`), else none, graphics and compute alike.
+/// - Without the prelude on NVIDIA: none for graphics (`blob_across_processes`); compute as it
+///   was (`compute`: the #505 compute rule is not on this line).
+pub(crate) unsafe fn blob_folder(this: *mut c_void, states: &[crate::gpu::recomp::pso::StaticSampler], compute: bool) -> Option<String> {
+    let prelude = crate::gpu::sampler_prelude::on();
+    if states.is_empty() || (compute && !prelude) || blob_across_processes(true, adapter_vendor(this)) {
+        return Some(String::new());
+    }
+    (prelude && crate::gpu::sampler_prelude::covers(states)).then(crate::gpu::sampler_prelude::dir)
+}
+
+/// `p` in the folder `folder` of its own folder ("": `p`).
+pub(crate) fn in_folder(p: std::path::PathBuf, folder: &str) -> std::path::PathBuf {
+    match (folder.is_empty(), p.parent(), p.file_name()) {
+        (false, Some(dir), Some(name)) => dir.join(folder).join(name),
+        _ => p,
+    }
+}
+
+/// The static sampler states of each XCL root signature made with some (`abi_rs_for`,
+/// `dispatch_chain::build`): a compute pipeline knows its samplers only by its root signature.
+static RS_STATES: Mutex<Option<HashMap<usize, Vec<crate::gpu::recomp::pso::StaticSampler>>>> = Mutex::new(None);
+
+pub(super) fn note_rs_states(rs: usize, states: &[crate::gpu::recomp::pso::StaticSampler]) {
+    RS_STATES.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, states.to_vec());
+}
+
+fn rs_states(rs: usize) -> Vec<crate::gpu::recomp::pso::StaticSampler> {
+    RS_STATES.lock().unwrap().as_ref().and_then(|m| m.get(&rs).cloned()).unwrap_or_default()
+}
+
 struct TwoPassBlob {
     key: (u64, usize, i32),
     disk: Option<std::path::PathBuf>,
 }
 
 impl TwoPassBlob {
-    fn new(hash: u64, bytes: usize, rs: *mut c_void, mesh: bool, persist: bool) -> Self {
+    /// `folder`: where under `driver\` its blob is kept (`blob_folder`); None: not on disk.
+    fn new(hash: u64, bytes: usize, rs: *mut c_void, mesh: bool, folder: Option<String>) -> Self {
         let (prefix, tag) = if mesh { ("tp-ms", 0x5450_0001) } else { ("tp-cs", 0x5450_0002) };
-        let disk = persist.then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(
+        let disk = folder.map(|f| in_folder(crate::gpu::recomp::dxc::cache_dir().join("driver").join(
             format!("{prefix}-{hash:016x}-{bytes:x}-0.pso"),
-        ));
+        ), &f));
         Self { key: (hash, rs as usize, tag), disk }
     }
 }
@@ -7495,9 +7535,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let driver = driver_identity(this);
     let persist = driver.is_some() && driver_cache::enabled();
     let windows = crate::gpu::recomp::pso::mem_windows();
-    let cs = TwoPassBlob::new(two_pass_cs_key(&tp.cs, &tp.samplers, driver.unwrap_or(0), windows), tp.cs.len(), rs, false, persist);
+    let cs_folder = if persist { blob_folder(this, &tp.samplers, true) } else { None };
+    let cs = TwoPassBlob::new(two_pass_cs_key(&tp.cs, &tp.samplers, driver.unwrap_or(0), windows), tp.cs.len(), rs, false, cs_folder);
     let mesh = two_pass_stream_key(&stream.0, ps_samplers, driver.unwrap_or(0), windows)
-        .map(|(h, n)| TwoPassBlob::new(h, n, mesh_rs, true, persist && blob_across_processes(!ps_samplers.is_empty(), adapter_vendor(this))));
+        .map(|(h, n)| TwoPassBlob::new(h, n, mesh_rs, true, if persist { blob_folder(this, ps_samplers, false) } else { None }));
 
     // Take at most one cold turn for the pair, also when a cached attempt needs a retry.
     let bytes = stream.shader_bytes() + tp.cs.len();
@@ -8685,6 +8726,16 @@ unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GU
 
 unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32, blob: *const c_void, len: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     crate::gpu::shader::capture("rootsig", blob as usize, len);
+    // (`XCL_SAMPLER_PRELUDE`: a title's root signature with static samplers: RTS0's count at 12)
+    if crate::gpu::sampler_prelude::on() && !blob.is_null() {
+        let b = std::slice::from_raw_parts(blob as *const u8, len);
+        let statics = crate::gpu::shader::container_parts(b)
+            .and_then(|parts| parts.into_iter().find(|p| p.fourcc == "RTS0"))
+            .and_then(|p| b.get(p.offset + 12..p.offset + 16).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+        if statics.is_some_and(|n| n > 0) {
+            crate::gpu::sampler_prelude::note("a title's root signature (hle/d3d12x/real.rs dev_create_root_signature)");
+        }
+    }
     type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const GUID, *mut *mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRootSignature")));
     let mut hr = f(this, mask, blob, len, riid, ppv);

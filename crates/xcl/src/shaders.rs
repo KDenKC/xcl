@@ -1542,7 +1542,9 @@ impl Pipelines {
                 return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
-        });
+        })
+        // (as the title's process takes it: `XCL_SAMPLER_PRELUDE`, #505)
+        .and_then(|p| unsafe { crate::hle::d3d12x::real::blob_folder(windows::core::Interface::as_raw(&self.dev), samplers, true) }.map(|f| crate::hle::d3d12x::real::in_folder(p, &f)));
         let mut cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
