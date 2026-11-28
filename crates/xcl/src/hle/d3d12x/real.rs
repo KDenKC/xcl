@@ -7350,7 +7350,7 @@ fn blob_across_processes(static_samplers: bool, vendor: Option<u32>) -> bool {
 /// The folder under `driver\` where a pipeline with the static sampler states `states`, made on
 /// `this`, keeps and takes its disk blob ("" the usual one); None: no disk blob (#505).
 /// - With no static samplers, or not on NVIDIA: the usual folder.
-/// - `XCL_SAMPLER_PRELUDE=1` on NVIDIA: the prelude's folder when it covers every state
+/// - `XCL_SAMPLER_PRELUDE=1` on NVIDIA: the prelude's folder for them (`folder_for`) when it covers every state
 ///   (`sampler_prelude::covers`), else none, graphics and compute alike.
 /// - Without the prelude on NVIDIA: none for graphics (`blob_across_processes`); compute as it
 ///   was (`compute`: the #505 compute rule is not on this line).
@@ -7359,7 +7359,7 @@ pub(crate) unsafe fn blob_folder(this: *mut c_void, states: &[crate::gpu::recomp
     if states.is_empty() || (compute && !prelude) || blob_across_processes(true, adapter_vendor(this)) {
         return Some(String::new());
     }
-    (prelude && crate::gpu::sampler_prelude::covers(states)).then(crate::gpu::sampler_prelude::dir)
+    if prelude && crate::gpu::sampler_prelude::covers(states) { crate::gpu::sampler_prelude::folder_for(states) } else { None }
 }
 
 /// `p` in the folder `folder` of its own folder ("": `p`).

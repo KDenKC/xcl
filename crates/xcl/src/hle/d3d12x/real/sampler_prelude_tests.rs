@@ -34,6 +34,18 @@ fn outside(k: usize) -> StaticSampler {
     ([0x92, 0x00c0_0000, 0x1400_0000 | ((k as u32 + 1) << 4), 0], false)
 }
 
+/// `1`: the pipeline's linear sampler is `GROWN` (outside the fixed list) instead
+const GROW: &str = "XCL_TEST_PRELUDE_GROW";
+
+/// A linear sampler outside the fixed list (a LOD bias of its own: no effect on one mip level)
+/// and outside the `outside` ones.
+const GROWN: StaticSampler = ([0x92, 0x00c0_0000, 0x1450_0000 | (9 << 4), 0], false);
+
+/// The pipeline's samplers in this child (`GROW`).
+fn samplers() -> [StaticSampler; 3] {
+    if std::env::var(GROW).is_ok_and(|v| v == "1") { [SAMPLERS[0], GROWN, SAMPLERS[2]] } else { SAMPLERS }
+}
+
 const PROGRAM: &str = "
 SamplerState p : register(s0, space1);
 SamplerState l : register(s1, space1);
@@ -291,11 +303,11 @@ unsafe fn draw(dev: &ID3D12Device, rs: &ID3D12RootSignature, pso: &ID3D12Pipelin
 /// built, and its blob kept there), drawn once. One `PRELUDE-CHILD` line.
 unsafe fn graphics_child(role: &str, dev: &ID3D12Device) {
     let raw = dev.as_raw();
-    let rs_raw = abi_rs_for(raw, &SAMPLERS).expect("root signature with the samplers");
+    let rs_raw = abi_rs_for(raw, &samplers()).expect("root signature with the samplers");
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).unwrap();
     let vs = crate::gpu::recomp::dxc::compile(GRAPHICS_PROGRAM, "vs", "vs_6_6", &[]).expect("DXC vs");
     let ps = crate::gpu::recomp::dxc::compile(GRAPHICS_PROGRAM, "ps", "ps_6_6", &[]).expect("DXC ps");
-    let folder = if std::env::var(RAW_BLOB).is_ok_and(|v| v == "1") { Some(String::new()) } else { blob_folder(raw, &SAMPLERS, false) };
+    let folder = if std::env::var(RAW_BLOB).is_ok_and(|v| v == "1") { Some(String::new()) } else { blob_folder(raw, &samplers(), false) };
     let file = folder.as_deref().map(|f| in_folder(crate::gpu::recomp::dxc::cache_dir().join("driver").join("gfx-prelude-test.pso"), f));
     let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::transmute_copy(rs),
@@ -312,17 +324,18 @@ unsafe fn graphics_child(role: &str, dev: &ID3D12Device) {
         desc.RTVFormats[k] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         desc.BlendState.RenderTarget[k].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
     }
+    let make = |desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC| -> windows::core::Result<ID3D12PipelineState> { dev.CreateGraphicsPipelineState(desc) };
     let blob = file.as_deref().and_then(|f| std::fs::read(f).ok());
     let from_blob = blob.as_ref().and_then(|b| {
         desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr().cast(), CachedBlobSizeInBytes: b.len() };
-        dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc).ok()
+        make(&desc).ok()
     });
     let reused = from_blob.is_some();
     let pso = match from_blob {
         Some(p) => p,
         None => {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let p: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&desc).expect("graphics pipeline");
+            let p: ID3D12PipelineState = make(&desc).expect("graphics pipeline");
             if let (Some(f), Ok(b)) = (file.as_deref(), p.GetCachedBlob()) {
                 driver_cache::write(f, std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()));
             }
@@ -362,14 +375,14 @@ fn child(role: &str) {
         if std::env::var(GRAPHICS).is_ok_and(|v| v == "1") {
             return graphics_child(role, &dev);
         }
-        let rs = abi_rs_for(raw, &SAMPLERS).expect("root signature with the samplers");
+        let rs = abi_rs_for(raw, &samplers()).expect("root signature with the samplers");
         let dxil = crate::gpu::recomp::dxc::compile(PROGRAM, "main", "cs_6_6", &[]).expect("DXC");
         let create: PsoFn = std::mem::transmute(windows::core::Interface::vtable(&dev).CreateComputePipelineState);
         let iid = pc_iid(Kind::PipelineState);
         let mut out = std::ptr::null_mut();
         let (hr, _, from_blob) = compute_container(raw, create, &D3D12_COMPUTE_PIPELINE_STATE_DESC::default(), rs, &dxil, crate::gpu::shader::fnv64(&dxil), &iid, &mut out, ComputeBuild::Whole);
         assert!(hr >= 0 && !out.is_null(), "compute_container: {hr:#x}");
-        let folder = blob_folder(raw, &SAMPLERS, true);
+        let folder = blob_folder(raw, &samplers(), true);
         let kept = folder.as_deref().and_then(|f| driver_cache::path_for(&dxil, 0, false).map(|p| in_folder(p, f))).is_some_and(|p| p.exists());
         let pso = ID3D12PipelineState::from_raw(out);
         let rs = ID3D12RootSignature::from_raw_borrowed(&rs).unwrap();
@@ -406,6 +419,23 @@ fn spawn(test: &str, role: &str, cache: &std::path::Path, env: &[(&str, &str)]) 
     Seen { from_blob: flag("from_blob"), kept: flag("kept"), right: flag("right"), line, stderr }
 }
 
+/// An NVIDIA GPU and DXC are there (else the test is skipped, and says so).
+fn ready() -> bool {
+    let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+        crate::gpu::recomp::runner::skip_test("no GPU");
+        return false;
+    };
+    if adapter_vendor(dev.as_raw()) != Some(0x10DE) {
+        crate::gpu::recomp::runner::skip_test("not NVIDIA (#505 and the prelude are NVIDIA's)");
+        return false;
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return false;
+    }
+    true
+}
+
 /// The parent of a case: skip without an NVIDIA GPU or DXC; `make` and `load` with their
 /// environments over a fresh cache: what each saw.
 fn case(test: &str, make: &[(&str, &str)], load: &[(&str, &str)]) -> Option<(Seen, Seen)> {
@@ -413,19 +443,7 @@ fn case(test: &str, make: &[(&str, &str)], load: &[(&str, &str)]) -> Option<(See
         child(&role);
         return None;
     }
-    let dev = match crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) {
-        Ok(d) => d,
-        Err(_) => {
-            crate::gpu::recomp::runner::skip_test("no GPU");
-            return None;
-        }
-    };
-    if adapter_vendor(dev.as_raw()) != Some(0x10DE) {
-        crate::gpu::recomp::runner::skip_test("not NVIDIA (#505 and the prelude are NVIDIA's)");
-        return None;
-    }
-    if crate::gpu::recomp::dxc::location().is_err() {
-        crate::gpu::recomp::runner::skip_test("no DXC");
+    if !ready() {
         return None;
     }
     let cache = std::env::temp_dir().join(format!("xcl-prelude-{}-{test}", std::process::id()));
@@ -450,15 +468,6 @@ fn gpu_prelude_in_both_processes_keeps_the_blob_right() {
     assert!(loaded.right, "{}", loaded.line);
 }
 
-/// Without the prelude (compute keeps its blobs on this line) the same blob reads wrong: the
-/// bug the prelude is for. (If a driver stops doing this, this test says so.)
-#[test]
-fn gpu_without_the_prelude_the_blob_reads_wrong_after_other_states() {
-    let Some((_, loaded)) = case("gpu_without_the_prelude_the_blob_reads_wrong_after_other_states", &[], &[(OTHERS, "10")]) else { return };
-    assert!(loaded.from_blob, "{}", loaded.line);
-    assert!(!loaded.right, "the driver read the blob right after 10 other states: #505's numbering is gone on it ({})", loaded.line);
-}
-
 /// A blob made with the prelude is not taken by a process without it, nor one made without it by
 /// a process with it (other folders): each builds its own and samples right.
 #[test]
@@ -480,12 +489,14 @@ fn gpu_a_static_sampler_before_the_prelude_turns_the_blobs_off() {
 
 /// Why the prelude's root signatures stay alive: made and RELEASED before 10 other states, its
 /// numbers go to those, and the blob of a process that kept them reads wrong. (Switch off; the
-/// list made by hand.)
+/// list made by hand; the graphics pipeline past the rule: on an RTX 3090 our compute kernel's
+/// blob reads right even with other states first, the graphics one does not.)
 #[test]
 fn gpu_a_released_prelude_gives_its_numbers_away() {
-    let Some((_, loaded)) = case("gpu_a_released_prelude_gives_its_numbers_away", &[(BY_HAND, "keep")], &[(BY_HAND, "keep"), (OTHERS, "10")]) else { return };
+    const TEST: &str = "gpu_a_released_prelude_gives_its_numbers_away";
+    let Some((_, loaded)) = case(TEST, &[GFX, RAW, (BY_HAND, "keep")], &[GFX, RAW, (BY_HAND, "keep"), (OTHERS, "10")]) else { return };
     assert!(loaded.from_blob && loaded.right, "kept in both: {}", loaded.line);
-    let Some((_, loaded)) = case("gpu_a_released_prelude_gives_its_numbers_away", &[(BY_HAND, "keep")], &[(BY_HAND, "release"), (OTHERS, "10")]) else { return };
+    let Some((_, loaded)) = case(TEST, &[GFX, RAW, (BY_HAND, "keep")], &[GFX, RAW, (BY_HAND, "release"), (OTHERS, "10")]) else { return };
     assert!(loaded.from_blob && !loaded.right, "released before the 10: {}", loaded.line);
 }
 
@@ -516,4 +527,36 @@ fn gpu_graphics_prelude_in_both_processes_keeps_the_blob_right() {
 fn gpu_graphics_without_the_prelude_keeps_no_blob() {
     let Some((made, loaded)) = case("gpu_graphics_without_the_prelude_keeps_no_blob", &[GFX], &[GFX, (OTHERS, "10")]) else { return };
     assert!(!made.kept && !loaded.from_blob && loaded.right, "{}", loaded.line);
+}
+
+/// The list grows: a process that meets a state outside it keeps no blob of that pipeline and
+/// adds the state to the list's file; the next process makes it in its prelude and keeps the
+/// blob in the longer list's folder; a third takes it, right after 10 other states. (Compute
+/// and graphics.)
+#[test]
+fn gpu_a_state_outside_the_list_is_added_and_kept_by_the_next_process() {
+    const TEST: &str = "gpu_a_state_outside_the_list_is_added_and_kept_by_the_next_process";
+    if let Ok(role) = std::env::var(ROLE) {
+        return child(&role);
+    }
+    if !ready() {
+        return;
+    }
+    for kind in [None, Some(GFX)] {
+        let cache = std::env::temp_dir().join(format!("xcl-prelude-grow-{}-{}", std::process::id(), kind.is_some()));
+        let _ = std::fs::remove_dir_all(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        let env = |more: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> { [ON, (GROW, "1")].into_iter().chain(kind).chain(more.iter().copied()).collect() };
+        let first = spawn(TEST, "first", &cache, &env(&[]));
+        let extra = std::fs::read_to_string(cache.join("driver").join("sampler-prelude-extra.txt")).unwrap_or_default();
+        let second = spawn(TEST, "second", &cache, &env(&[]));
+        let third = spawn(TEST, "third", &cache, &env(&[(OTHERS, "10")]));
+        let _ = std::fs::remove_dir_all(&cache);
+        eprintln!("{TEST} ({}):\n  {}\n  list file: {extra:?}\n  {}\n  {}", if kind.is_some() { "graphics" } else { "compute" }, first.line, second.line, third.line);
+        assert!(first.right && !first.kept && !first.from_blob && first.line.contains("folder=None"), "the first process: no folder for the outside state: {}", first.line);
+        assert_eq!(extra.lines().count(), 1, "the state was added to the list's file once: {extra:?}");
+        assert!(second.right && second.kept && !second.from_blob, "the second process keeps the blob in the longer list's folder: {}", second.line);
+        assert!(!second.line.contains(&format!("\"{}\"", crate::gpu::sampler_prelude::dir())), "not the fixed list's folder: {}", second.line);
+        assert!(third.from_blob && third.right, "the third takes it and samples right after 10 other states: {}", third.line);
+    }
 }
