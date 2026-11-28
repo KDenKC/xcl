@@ -2292,6 +2292,26 @@ struct IndirectFeedback {
     by_pso: HashMap<usize, usize>,
 }
 
+/// (diagnostic, not for a PR) the GPU-side indirect mesh group counts per pipeline:
+/// encoded 0 = the slot did not run in the window, 1 = ran with 0 groups, N+1 = at most N groups.
+/// The first 5 readbacks from 240 s after the first one.
+fn fb_diag_log(by_pso: &HashMap<usize, usize>, vals: &[u32]) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static N: AtomicU32 = AtomicU32::new(0);
+    if START.get_or_init(std::time::Instant::now).elapsed().as_secs() < 240 || N.fetch_add(1, Relaxed) >= 5 {
+        return;
+    }
+    let (mut idle, mut zero, mut some) = (0, 0, 0);
+    let mut rows: Vec<(usize, u32)> = by_pso.iter().filter_map(|(&pso, &i)| vals.get(i).map(|&v| (pso, v))).collect();
+    rows.sort();
+    for &(_, v) in &rows {
+        match v { 0 => idle += 1, 1 => zero += 1, _ => some += 1 }
+    }
+    let list: Vec<String> = rows.iter().filter(|r| r.1 != 0).map(|(p, v)| format!("{p:#x}:{}", v - 1)).collect();
+    crate::xlog_info!("D3D12.X: [diag] indirect mesh feedback: {} slots, {idle} not run, {zero} ran with 0 groups, {some} with groups; pso:max groups {}", rows.len(), list.join(" "));
+}
+
 unsafe fn feedback_buffer(
     dev: &ID3D12Device,
     heap: D3D12_HEAP_TYPE,
@@ -2392,6 +2412,7 @@ impl IndirectFeedback {
             if clamped_groups > 0 {
                 note_two_pass_add(TP_INDIRECT_GROUPS_DROPPED, clamped_groups);
             }
+            fb_diag_log(&self.by_pso, &vals[FEEDBACK_HEADER_U32S..]);
             for (slot, &encoded) in self.slots.iter_mut().zip(&vals[FEEDBACK_HEADER_U32S..]) {
                 slot.apply_window(encoded);
             }
